@@ -1,14 +1,38 @@
 import socket
 import threading
 from handshake import send_handshake, receive_handshake
+from messages import encode_message, decode_message
+
+# 5 + PieceSize (16384 in both sample configs). Replace with the config value once Config is merged
+MAX_MESSAGE_LENGTH = 16389
+
+# Receive exactly n bytes, looping since TCP may deliver them across several recv calls
+def recv_exact(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        partial = sock.recv(n - len(data)) # Only ask for what is still missing so the next message stays in the socket
+        if not partial:
+            raise ConnectionError("Peer was disconnected mid-message")
+        data.extend(partial)
+    return bytes(data)
 
 # Read the four length bytes then based on that number read that many body bytes
 def read_message(sock, max_message_length):
-    return None
+    header = recv_exact(sock, 4)
+    length = int.from_bytes(header, byteorder="big", signed=False)
+
+    # Reject a corrupt length before waiting on bytes that will never come
+    if length < 1 or length > max_message_length:
+        raise ValueError(f"Invalid message length: {length}")
+
+    body = recv_exact(sock, length)
+    return decode_message(body)
 
 # Encode then sendall under a socket's send lock.
 def send_message(sock, send_lock, message_type, payload=b""):
-    return None
+    data = encode_message(message_type, payload) # Encode outside the lock to keep the locked section short
+    with send_lock:
+        sock.sendall(data)
 
 # Listen and connect to earlier entries in the peer list
 # Validate the handshakes and reject unknowns, duplicate or self connections
