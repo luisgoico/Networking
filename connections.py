@@ -113,7 +113,7 @@ def start_connections(local_peer_id, peers, on_connected):
     for neighbor in peers[:local_index]:
         try:
             sock = socket.create_connection(
-                (neighbor["host"], neighbor["port"]),
+                (neighbor["hostname"], neighbor["port"]),
                 timeout=10
             )
         except OSError as error:
