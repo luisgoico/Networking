@@ -3,7 +3,7 @@ import threading
 from datetime import datetime
 
 class Logger:
-    def __init__(self, peer_id):
+  def __init__(self, peer_id):
         self.peer_id = peer_id
         self._lock = threading.Lock()
         self.path = os.path.join(os.getcwd(), f"log_peer_{peer_id}.log")
