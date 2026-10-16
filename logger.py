@@ -13,6 +13,8 @@ class Logger:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {text}\n"
     with self._lock:
+        if self._file.close:
+            return
         self._file.write(line)
         self._file.flush()
 
