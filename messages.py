@@ -21,6 +21,18 @@ MESSAGE_NAMES = {
 LENGTH_SIZE = 4
 INDEX_SIZE = 4
 
+# Allowed payload length per type as (min, max), None means no upper limit
+PAYLOAD_RULES = {
+    CHOKE: (0, 0),
+    UNCHOKE: (0, 0),
+    INTERESTED: (0, 0),
+    NOT_INTERESTED: (0, 0),
+    HAVE: (INDEX_SIZE, INDEX_SIZE),
+    BITFIELD: (1, None),
+    REQUEST: (INDEX_SIZE, INDEX_SIZE),
+    PIECE: (INDEX_SIZE, None),
+}
+
 
 # Build the wire bytes: 4 byte length, 1 byte type, then the payload
 def encode_message(message_type:int, payload:bytes=b"") -> bytes:
@@ -39,20 +51,13 @@ def decode_message(body:bytes) -> tuple:
     message_type = body[0]
     payload = body[1:]
 
-    if message_type in (CHOKE, UNCHOKE, INTERESTED, NOT_INTERESTED):
-        if len(payload) != 0:
-            raise ValueError(f"{MESSAGE_NAMES[message_type]} message must have no payload")
-    elif message_type in (HAVE, REQUEST):
-        if len(payload) != INDEX_SIZE:
-            raise ValueError(f"{MESSAGE_NAMES[message_type]} payload must be exactly 4 bytes")
-    elif message_type == BITFIELD:
-        if len(payload) < 1:
-            raise ValueError("bitfield payload must be at least 1 byte")
-    elif message_type == PIECE:
-        if len(payload) < INDEX_SIZE:
-            raise ValueError("piece payload must be at least 4 bytes")
-    else:
+    if message_type not in PAYLOAD_RULES:
         raise ValueError(f"Unknown message type: {message_type}")
+
+    min_len, max_len = PAYLOAD_RULES[message_type]
+    if len(payload) < min_len or (max_len is not None and len(payload) > max_len):
+        expected = f"{min_len}" if min_len == max_len else f"at least {min_len}"
+        raise ValueError(f"{MESSAGE_NAMES[message_type]} payload must be {expected} bytes, got {len(payload)}")
 
     return message_type, payload
 
@@ -62,11 +67,8 @@ def pack_index(index:int) -> bytes:
     return index.to_bytes(INDEX_SIZE, byteorder="big", signed=False)
 
 
-# Reverse of pack_index, check the payload is exactly 4 bytes
+# Reverse of pack_index, payload size is already checked by decode_message
 def unpack_index(payload:bytes) -> int:
-    if len(payload) != INDEX_SIZE:
-        raise ValueError(f"Index payload must be exactly {INDEX_SIZE} bytes")
-
     return int.from_bytes(payload, byteorder="big", signed=False)
 
 
@@ -75,9 +77,6 @@ def pack_piece(index:int, data:bytes) -> bytes:
     return pack_index(index) + data
 
 
-# First 4 bytes are the index, the rest is the data
+# First 4 bytes are the index, the rest is the data, size already checked by decode_message
 def unpack_piece(payload:bytes) -> tuple:
-    if len(payload) < INDEX_SIZE:
-        raise ValueError(f"Piece payload must be at least {INDEX_SIZE} bytes")
-
     return unpack_index(payload[:INDEX_SIZE]), payload[INDEX_SIZE:]
