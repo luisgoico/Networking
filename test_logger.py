@@ -70,10 +70,10 @@ def test_close():
 if __name__ == "__main__":
   with tempfile.TemporaryDirectory() as tmp:
     os.chdir(tmp)
-        test_messages()
-        print("PASS: all message formats")
-        test_threads()
-        print("PASS: threads")
-        test_close()
-        print("PASS: close twice")
-        print("All logger tests passed.")
+      test_messages()
+      print("PASS: all message formats")
+      test_threads()
+      print("PASS: threads")
+      test_close()
+      print("PASS: close twice")
+      print("All logger tests passed.")
