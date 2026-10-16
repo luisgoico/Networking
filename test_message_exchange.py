@@ -7,8 +7,8 @@ from messages import BITFIELD, INTERESTED, MESSAGE_NAMES
 
 # Testing two peers on one computer, using different ports.
 peers = [
-    {"peer_id": 1001, "host": "127.0.0.1", "port": 6001},
-    {"peer_id": 1002, "host": "127.0.0.1", "port": 6002},
+    {"peer_id": 1001, "hostname": "127.0.0.1", "port": 6001},
+    {"peer_id": 1002, "hostname": "127.0.0.1", "port": 6002},
 ]
 
 local_peer_id = int(sys.argv[1])
