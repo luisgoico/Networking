@@ -136,7 +136,7 @@ class Peer:
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python peer.py <peer_id>")
+        print("Usage: python peerProcess.py <peer_id>")
         sys.exit(1)
 
     try:
