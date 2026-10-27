@@ -3,14 +3,21 @@ import socket
 import threading
 from config import read_common, read_peers
 from connections import start_connections, read_message, send_message, MAX_MESSAGE_LENGTH
-from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE
+from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE, BITFIELD
 from logger import Logger
+from bitfield import Bitfield, bitfield_from_bytes
 
 class Peer:
     def __init__(self, peer_id):
         self.peer_id = peer_id
         self.common = read_common()
         self.peers = read_peers()
+        # Ceiling division: floor of the negative rounds toward -inf, negating back rounds up
+        self.num_pieces = -(-self.common["FileSize"] // self.common["PieceSize"])
+
+        peers_by_id = {peer["peer_id"]: peer for peer in self.peers}
+        self.bitfield = Bitfield(self.num_pieces, peers_by_id[peer_id]["has_file"])
+        self.peer_bitfields = {}
 
         self.connections = {}
         self.send_locks = {}
@@ -24,9 +31,18 @@ class Peer:
         self.logger = Logger(peer_id)
 
     def on_connected(self, remote_id, sock, outgoing):
+        send_lock = threading.Lock()
+        with self.lock:
+            payload = self.bitfield.to_bytes() if self.bitfield.count() > 0 else None
+
+        # Bitfield goes out before registering so no other thread can send to this peer first
+        if payload is not None:
+            send_message(sock, send_lock, BITFIELD, payload)
+
         with self.lock:
             self.connections[remote_id] = sock
-            self.send_locks[remote_id] = threading.Lock()
+            self.send_locks[remote_id] = send_lock
+            self.peer_bitfields[remote_id] = Bitfield(self.num_pieces)
 
         #log the connection
         if outgoing:
@@ -44,7 +60,7 @@ class Peer:
         )
         thread.start()
 
-        self.send_to_peer(remote_id, INTERESTED)
+        # self.send_to_peer(remote_id, INTERESTED)
 
     def receive_messages(self, remote_id, sock):
         try:
@@ -67,6 +83,9 @@ class Peer:
                 elif message_type == HAVE:
                     index = int.from_bytes(payload, byteorder="big")
                     self.logger.received_have(remote_id, index)
+                elif message_type == BITFIELD:
+                    with self.lock:
+                        self.peer_bitfields[remote_id] = bitfield_from_bytes(payload, self.num_pieces)
                 #can't handle this yet because we don't have the pieces done but this is here as a frame; we'll need to import PIECE from messages too
                 #elif message_type == PIECE:
                 #    self.logger.download_piece(remote_id, index, num_pieces)
@@ -81,6 +100,7 @@ class Peer:
             with self.lock:
                 if self.connections.get(remote_id) is sock:
                     del self.connections[remote_id]
+                    self.peer_bitfields.pop(remote_id, None)
             sock.close()
 
     def send_to_peer(self, remote_id, message_type, payload=b""):
