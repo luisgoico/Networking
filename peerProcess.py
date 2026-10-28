@@ -5,12 +5,15 @@ from config import read_common, read_peers
 from connections import start_connections, read_message, send_message, MAX_MESSAGE_LENGTH
 from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE
 from logger import Logger
+from file_manager import FileManager
 
 class Peer:
     def __init__(self, peer_id):
         self.peer_id = peer_id
         self.common = read_common()
         self.peers = read_peers()
+        local_peer = next(peer for peer in self.peers if peer["peer_id"] == self.peer_id)
+        self.file_manager = FileManager(self.peer_id, self.common, local_peer["has_file"])
 
         self.connections = {}
         self.send_locks = {}
