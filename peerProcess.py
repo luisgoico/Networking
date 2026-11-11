@@ -97,13 +97,28 @@ class Peer:
                     if self.piece_needed(index) and remote_id not in self.interested_in_peers:
                         self.send_to_peer(remote_id, INTERESTED)
                         self.interested_in_peers.add(remote_id)
+
+                    # TODO: update bitfield
                 elif message_type == BITFIELD:
+                    peer_bitfield = bitfield_from_bytes(payload, self.num_pieces)
+
                     with self.lock:
-                        self.peer_bitfields[remote_id] = bitfield_from_bytes(payload, self.num_pieces)
+                        self.peer_bitfields[remote_id] = peer_bitfield
+                        missing_pieces = self.bitfield.missing_from(peer_bitfield) # in lock so either bitfield isn't modified while checking
+
+                    if missing_pieces and remote_id not in self.interested_in_peers:
+                        self.send_to_peer(remote_id, INTERESTED)
+                        self.interested_in_peers.add(remote_id)
+
+                    else:
+                        if remote_id in self.interested_in_peers:
+                            self.send_to_peer(remote_id, NOT_INTERESTED)
+                            self.interested_in_peers.discard(remote_id)
+
                 #can't handle this yet because we don't have the pieces done but this is here as a frame; we'll need to import PIECE from messages too
                 #elif message_type == PIECE:
                 #    self.logger.download_piece(remote_id, index, num_pieces)
-
+                # TODO: check if still interested in peer after receiving piece
                 # Message-specific processing will go here.
 
         except (ConnectionError, OSError, ValueError) as error:
