@@ -33,6 +33,9 @@ class Peer:
 
         self.logger = Logger(peer_id)
 
+        self.interested_peers = set()
+        self.interested_in_peers = set()
+
     def on_connected(self, remote_id, sock, outgoing):
         send_lock = threading.Lock()
         with self.lock:
@@ -81,18 +84,41 @@ class Peer:
                     self.logger.unchoked_by(remote_id)
                 elif message_type == INTERESTED:
                     self.logger.received_interested(remote_id)
+                    # add the remote_id to the interested_peers set to be considered for unchoking
+                    self.interested_peers.add(remote_id)
                 elif message_type == NOT_INTERESTED:
                     self.logger.received_not_interested(remote_id)
+                    # remove the remote_id from the interested_peers set to not be considered for unchoking
+                    self.interested_peers.discard(remote_id)
                 elif message_type == HAVE:
                     index = int.from_bytes(payload, byteorder="big")
                     self.logger.received_have(remote_id, index)
+                    # Check if we need this piece and haven't already indicated interest, then send INTERESTED
+                    if self.piece_needed(index) and remote_id not in self.interested_in_peers:
+                        self.send_to_peer(remote_id, INTERESTED)
+                        self.interested_in_peers.add(remote_id)
+
+                    # TODO: update bitfield
                 elif message_type == BITFIELD:
+                    peer_bitfield = bitfield_from_bytes(payload, self.num_pieces)
+
                     with self.lock:
-                        self.peer_bitfields[remote_id] = bitfield_from_bytes(payload, self.num_pieces)
+                        self.peer_bitfields[remote_id] = peer_bitfield
+                        missing_pieces = self.bitfield.missing_from(peer_bitfield) # in lock so either bitfield isn't modified while checking
+
+                    if missing_pieces and remote_id not in self.interested_in_peers:
+                        self.send_to_peer(remote_id, INTERESTED)
+                        self.interested_in_peers.add(remote_id)
+
+                    else:
+                        if remote_id in self.interested_in_peers:
+                            self.send_to_peer(remote_id, NOT_INTERESTED)
+                            self.interested_in_peers.discard(remote_id)
+
                 #can't handle this yet because we don't have the pieces done but this is here as a frame; we'll need to import PIECE from messages too
                 #elif message_type == PIECE:
                 #    self.logger.download_piece(remote_id, index, num_pieces)
-
+                # TODO: check if still interested in peer after receiving piece
                 # Message-specific processing will go here.
 
         except (ConnectionError, OSError, ValueError) as error:
