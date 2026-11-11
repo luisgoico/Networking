@@ -1,5 +1,6 @@
 import sys
 import socket
+import random
 import threading
 from config import read_common, read_peers
 from connections import start_connections, read_message, send_message, MAX_MESSAGE_LENGTH
@@ -32,6 +33,17 @@ class Peer:
 
         self.interested_peers = set()
         self.interested_in_peers = set()
+
+        #choke/unchoke
+        # k = max # of preferred neighbors, p = unchoking interval, m = optimistic unchoke interval
+        self.k = self.common["NumberOfPreferredNeighbors"]
+        self.unchoke_interval = self.common["UnchokingInterval"]
+        self.opt_interval = self.common["OptimisticUnchokingInterval"]
+
+        self.preferred = set()
+        self.optimistic = None
+        self.unchoked = set()
+        self.bytes_downloaded = {}
 
     def on_connected(self, remote_id, sock, outgoing):
         send_lock = threading.Lock()
@@ -81,11 +93,13 @@ class Peer:
                 elif message_type == INTERESTED:
                     self.logger.received_interested(remote_id)
                     # add the remote_id to the interested_peers set to be considered for unchoking
-                    self.interested_peers.add(remote_id)
+                    with self.lock:
+                        self.interested_peers.add(remote_id)
                 elif message_type == NOT_INTERESTED:
                     self.logger.received_not_interested(remote_id)
                     # remove the remote_id from the interested_peers set to not be considered for unchoking
-                    self.interested_peers.discard(remote_id)
+                    with self.lock:
+                        self.interested_peers.discard(remote_id)
                 elif message_type == HAVE:
                     index = unpack_index(payload)
                     self.logger.received_have(remote_id, index)
@@ -94,7 +108,7 @@ class Peer:
                         self.peer_bitfields[remote_id].set(index)
 
                     # Check if we need this piece and haven't already indicated interest, then send INTERESTED
-                    if self.piece_needed(index) and remote_id not in self.interested_in_peers:
+                    if self.piece_needed(index) and remote_id not in self.interested_in_peers:                   # QUERY: Is piece_needed defined anywhere?
                         self.send_to_peer(remote_id, INTERESTED)
                         self.interested_in_peers.add(remote_id)
                 elif message_type == BITFIELD:
@@ -115,6 +129,8 @@ class Peer:
 
                 elif message_type == PIECE:
                     index, data = unpack_piece(payload)
+                    # count bytes sent, used to rank neighbors by download rate
+                    self.record_download_rate(remote_id, len(data))
                     # save_piece returns the new piece count, or None if we already had this piece
                     count = self.file_manager.save_piece(index, data)
                     if count is not None:
@@ -132,8 +148,72 @@ class Peer:
                 if self.connections.get(remote_id) is sock:
                     del self.connections[remote_id]
                     self.peer_bitfields.pop(remote_id, None)
+                    self.interested_peers.discard(remote_id)
+                    self.interested_in_peers.discard(remote_id)
+                    self.preferred.discard(remote_id)
+                    self.unchoked.discard(remote_id)
+                    self.bytes_downloaded.pop(remote_id, None)
+                    if self.optimistic == remote_id:
+                        self.optimistic = None
             sock.close()
 
+    # adds nbytes to the peer's running total to determine downloading rate based on byte totals
+    # called by PIECE handler
+    def record_download_rate(self, remote_id, nbytes):
+        with self.lock:
+            self.bytes_downloaded[remote_id] = self.bytes_downloaded.get(remote_id, 0) + nbytes
+
+    # Runs every p seconds and builds a candidate list of preferred interested neighbors
+    def select_preferred(self):
+        complete = self.file_manager.is_complete()
+        with self.lock:
+            candidates = [p for p in self.interested_peers if p in self.connections]
+            random.shuffle(candidates) # Candidates are shuffled for randomization to break ties.
+            if not complete:
+                candidates.sort(key=lambda p: self.bytes_downloaded.get(p, 0), reverse=True) # prioritizes highest rate of previous interval if still downloading
+            self.preferred = set(candidates[:self.k])
+            self.bytes_downloaded.clear() # clears bytes to start each interval at zero
+            chosen = candidates[:self.k]
+        
+        self.logger.preferred_neighbors(chosen)
+        self.apply_choke_state()
+
+    # Runs every m seconds to pick one random interested choked neighbor
+    def select_optimistic(self):
+        with self.lock:
+            candidates = [p for p in self.interested_peers if p in self.connections and p not in self.unchoked]
+            self.optimistic = random.choice(candidates) if candidates else None
+            chosen = self.optimistic
+            
+        if chosen is not None:
+            self.logger.optimistic_unchoked(chosen)
+        self.apply_choke_state()
+
+    # unchoked set = preferred + optimistic
+    # UNCHOKE to newly selected neighbors, CHOKE to neigbors that were unchoked but no longer selected
+    # neighbors that remain unchoked do not receive a message
+    def apply_choke_state(self):
+        with self.lock:
+            desired = set(self.preferred)
+            if self.optimistic is not None:
+                desired.add(self.optimistic)
+            desired &= set(self.connections) # ignores disconnected neighbors
+            to_unchoke = desired - self.unchoked
+            to_choke = self.unchoked - desired
+            self.unchoked = desired
+
+        messages = [(pid, UNCHOKE) for pid in to_unchoke] + [(pid, CHOKE) for pid in to_choke]
+        for pid, message_type in messages:
+            try:
+                self.send_to_peer(pid, message_type)
+            except (ConnectionError, OSError):
+                pass
+
+    # calls fn every interval of seconds until stop_event
+    def timer_loop(self, interval, fn):
+        while not self.stop_event.wait(interval):
+            fn()
+    
     def send_to_peer(self, remote_id, message_type, payload=b""):
         with self.lock:
             sock = self.connections.get(remote_id)
@@ -144,6 +224,7 @@ class Peer:
 
         send_message(sock, send_lock, message_type, payload)
 
+    
     def start(self):
         print(f"Starting peer {self.peer_id}")
 
@@ -152,6 +233,10 @@ class Peer:
             self.peers,
             self.on_connected,
         )
+
+        # threads for the timers
+        threading.Thread(target=self.timer_loop, args=(self.unchoke_interval, self.select_preferred), daemon=True).start()
+        threading.Thread(target=self.timer_loop, args=(self.opt_interval, self.select_optimistic), daemon=True).start()
 
         print("Peer is running. Press Ctrl+C to stop.")
 
