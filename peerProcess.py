@@ -93,6 +93,13 @@ class Peer:
                 elif message_type == HAVE:
                     index = int.from_bytes(payload, byteorder="big")
                     self.logger.received_have(remote_id, index)
+                    # Check if we need this piece and haven't already indicated interest, then send INTERESTED
+                    if self.piece_needed(index) and remote_id not in self.interested_in_peers:
+                        self.send_to_peer(remote_id, INTERESTED)
+                        self.interested_in_peers.add(remote_id)
+                elif message_type == BITFIELD:
+                    with self.lock:
+                        self.peer_bitfields[remote_id] = bitfield_from_bytes(payload, self.num_pieces)
                 #can't handle this yet because we don't have the pieces done but this is here as a frame; we'll need to import PIECE from messages too
                 #elif message_type == PIECE:
                 #    self.logger.download_piece(remote_id, index, num_pieces)
