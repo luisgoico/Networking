@@ -3,7 +3,7 @@ import socket
 import threading
 from config import read_common, read_peers
 from connections import start_connections, read_message, send_message, MAX_MESSAGE_LENGTH
-from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE, BITFIELD
+from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE, BITFIELD, PIECE, unpack_index, unpack_piece
 from logger import Logger
 from bitfield import Bitfield, bitfield_from_bytes
 from file_manager import FileManager
@@ -13,14 +13,11 @@ class Peer:
         self.peer_id = peer_id
         self.common = read_common()
         self.peers = read_peers()
-        # Ceiling division: floor of the negative rounds toward -inf, negating back rounds up
-        self.num_pieces = -(-self.common["FileSize"] // self.common["PieceSize"])
-
-        peers_by_id = {peer["peer_id"]: peer for peer in self.peers}
-        self.bitfield = Bitfield(self.num_pieces, peers_by_id[peer_id]["has_file"])
-        self.peer_bitfields = {}
         local_peer = next(peer for peer in self.peers if peer["peer_id"] == self.peer_id)
+        # FileManager owns this peer's bitfield and the file on disk
         self.file_manager = FileManager(self.peer_id, self.common, local_peer["has_file"])
+        self.num_pieces = self.file_manager.num_pieces
+        self.peer_bitfields = {}
 
         self.connections = {}
         self.send_locks = {}
@@ -38,8 +35,7 @@ class Peer:
 
     def on_connected(self, remote_id, sock, outgoing):
         send_lock = threading.Lock()
-        with self.lock:
-            payload = self.bitfield.to_bytes() if self.bitfield.count() > 0 else None
+        payload = self.file_manager.bitfield_bytes() if self.file_manager.count() > 0 else None
 
         # Bitfield goes out before registering so no other thread can send to this peer first
         if payload is not None:
@@ -91,20 +87,22 @@ class Peer:
                     # remove the remote_id from the interested_peers set to not be considered for unchoking
                     self.interested_peers.discard(remote_id)
                 elif message_type == HAVE:
-                    index = int.from_bytes(payload, byteorder="big")
+                    index = unpack_index(payload)
                     self.logger.received_have(remote_id, index)
+
+                    with self.lock:
+                        self.peer_bitfields[remote_id].set(index)
+
                     # Check if we need this piece and haven't already indicated interest, then send INTERESTED
                     if self.piece_needed(index) and remote_id not in self.interested_in_peers:
                         self.send_to_peer(remote_id, INTERESTED)
                         self.interested_in_peers.add(remote_id)
-
-                    # TODO: update bitfield
                 elif message_type == BITFIELD:
                     peer_bitfield = bitfield_from_bytes(payload, self.num_pieces)
 
                     with self.lock:
                         self.peer_bitfields[remote_id] = peer_bitfield
-                        missing_pieces = self.bitfield.missing_from(peer_bitfield) # in lock so either bitfield isn't modified while checking
+                        missing_pieces = self.file_manager.missing_from(peer_bitfield) # in lock so either bitfield isn't modified while checking
 
                     if missing_pieces and remote_id not in self.interested_in_peers:
                         self.send_to_peer(remote_id, INTERESTED)
@@ -115,9 +113,13 @@ class Peer:
                             self.send_to_peer(remote_id, NOT_INTERESTED)
                             self.interested_in_peers.discard(remote_id)
 
-                #can't handle this yet because we don't have the pieces done but this is here as a frame; we'll need to import PIECE from messages too
-                #elif message_type == PIECE:
-                #    self.logger.download_piece(remote_id, index, num_pieces)
+                elif message_type == PIECE:
+                    index, data = unpack_piece(payload)
+                    # save_piece returns the new piece count, or None if we already had this piece
+                    count = self.file_manager.save_piece(index, data)
+                    if count is not None:
+                        self.logger.download_piece(remote_id, index, count)
+
                 # TODO: check if still interested in peer after receiving piece
                 # Message-specific processing will go here.
 
