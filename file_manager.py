@@ -71,7 +71,7 @@ class FileManager:
 
     def save_piece(self, index, data):
         # Save a piece by a different peer.
-        # Returns False if piece is already owned
+        # Returns the new number of owned pieces, or None if piece is already owned
         expected_size = self.expected_size(index)
 
         if len(data) != expected_size:
@@ -79,7 +79,7 @@ class FileManager:
 
         with self.lock:
             if self.bitfield.has(index):
-                return False
+                return None
 
             with self.path.open("rb+") as file:
                 file.seek(index * self.piece_size)
@@ -90,7 +90,8 @@ class FileManager:
 
             # Send ownership of piece after the piece was completely written
             self.bitfield.set(index)
-            return True
+            # Counted inside the lock so it reflects exactly this save
+            return self.bitfield.count()
 
     def count(self):
         # Return number of pieces owned by this peer
@@ -105,3 +106,8 @@ class FileManager:
         # Build a BITFIELD message
         with self.lock:
             return self.bitfield.to_bytes()
+
+    def missing_from(self, other_bitfield):
+        # Pieces other_bitfield has that this peer doesn't, empty means not interested
+        with self.lock:
+            return self.bitfield.missing_from(other_bitfield)
