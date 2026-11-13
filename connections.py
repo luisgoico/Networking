@@ -3,8 +3,7 @@ import threading
 from handshake import send_handshake, receive_handshake
 from messages import encode_message, decode_message
 
-# 5 + PieceSize (16384 in both sample configs). Replace with the config value once Config is merged
-MAX_MESSAGE_LENGTH = 16389
+
 
 # Receive exactly n bytes, looping since TCP may deliver them across several recv calls
 def recv_exact(sock, n):
@@ -81,7 +80,7 @@ def start_connections(local_peer_id, peers, on_connected):
             if registered_id is not None:
                 with connection_lock:
                     connected_ids.discard(registered_id)
-            print(f"Connection failed: error")
+            print(f"Connection failed: {error}")
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
