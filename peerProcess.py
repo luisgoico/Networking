@@ -3,8 +3,9 @@ import socket
 import random
 import threading
 from config import read_common, read_peers
-from connections import start_connections, read_message, send_message, MAX_MESSAGE_LENGTH
-from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE, BITFIELD, PIECE, unpack_index, unpack_piece
+from connections import start_connections, read_message, send_message
+from messages import MESSAGE_NAMES, INTERESTED, CHOKE, UNCHOKE, NOT_INTERESTED, HAVE, BITFIELD, PIECE, pack_index, \
+    unpack_index, pack_piece, unpack_piece, REQUEST
 from logger import Logger
 from bitfield import Bitfield, bitfield_from_bytes
 from file_manager import FileManager
@@ -45,6 +46,10 @@ class Peer:
         self.unchoked = set()
         self.bytes_downloaded = {}
 
+        self.unchoked_by = set()
+        self.pending_requests = {}
+        self.completion_logged = False
+
     def on_connected(self, remote_id, sock, outgoing):
         send_lock = threading.Lock()
         payload = self.file_manager.bitfield_bytes() if self.file_manager.count() > 0 else None
@@ -80,7 +85,7 @@ class Peer:
         try:
             while self.running.is_set():
                 message_type, payload = read_message(
-                    sock, MAX_MESSAGE_LENGTH
+                    sock, self.common["PieceSize"]+5
                 )
 
                 name = MESSAGE_NAMES[message_type]
@@ -88,8 +93,20 @@ class Peer:
 
                 if message_type == CHOKE:
                     self.logger.choked_by(remote_id)
+
+                    with self.lock:
+                        self.unchoked_by.discard(remote_id)
+                        self.pending_requests.pop(remote_id, None)
+
                 elif message_type == UNCHOKE:
                     self.logger.unchoked_by(remote_id)
+
+                    with self.lock:
+                        self.unchoked_by.add(remote_id)
+
+                    #Once it is unchoked, we can request a piece from this peer
+                    self.request_piece(remote_id)
+
                 elif message_type == INTERESTED:
                     self.logger.received_interested(remote_id)
                     # add the remote_id to the interested_peers set to be considered for unchoking
@@ -102,42 +119,91 @@ class Peer:
                         self.interested_peers.discard(remote_id)
                 elif message_type == HAVE:
                     index = unpack_index(payload)
-                    self.logger.received_have(remote_id, index)
 
                     with self.lock:
                         self.peer_bitfields[remote_id].set(index)
 
-                    # Check if we need this piece and haven't already indicated interest, then send INTERESTED
-                    if self.piece_needed(index) and remote_id not in self.interested_in_peers:                   # QUERY: Is piece_needed defined anywhere?
-                        self.send_to_peer(remote_id, INTERESTED)
-                        self.interested_in_peers.add(remote_id)
+                    self.logger.received_have(remote_id, index)
+                    self.update_interest(remote_id)
+                    self.request_piece(remote_id)
+
                 elif message_type == BITFIELD:
                     peer_bitfield = bitfield_from_bytes(payload, self.num_pieces)
 
                     with self.lock:
                         self.peer_bitfields[remote_id] = peer_bitfield
-                        missing_pieces = self.file_manager.missing_from(peer_bitfield) # in lock so either bitfield isn't modified while checking
 
-                    if missing_pieces and remote_id not in self.interested_in_peers:
-                        self.send_to_peer(remote_id, INTERESTED)
-                        self.interested_in_peers.add(remote_id)
+                    self.update_interest(remote_id)
+                    self.request_piece(remote_id)
 
-                    else:
-                        if remote_id in self.interested_in_peers:
-                            self.send_to_peer(remote_id, NOT_INTERESTED)
-                            self.interested_in_peers.discard(remote_id)
+                elif message_type == REQUEST:
+                    index = unpack_index(payload)
+
+                    #Check if this peer is unchoked which allows it to download
+                    with self.lock:
+                        allowed = remote_id in self.unchoked
+
+                    if not allowed:
+                        print(f"Ignore request from choked peer {remote_id}")
+                        continue
+
+                    #Read requested piece from our file
+                    if not self.file_manager.has_piece(index):
+                        print(f"Peer does not own piece {index}")
+                        continue
+
+                    data = self.file_manager.read_piece(index)
+
+                    #Send index and piece data
+                    self.send_to_peer(remote_id, PIECE, pack_piece(index, data))
+
+
 
                 elif message_type == PIECE:
                     index, data = unpack_piece(payload)
-                    # count bytes sent, used to rank neighbors by download rate
-                    self.record_download_rate(remote_id, len(data))
+                    #Check that this piece was requested
+                    with self.lock:
+                        expected = self.pending_requests.get(remote_id)
+
+                    if expected != index:
+                        print(f"Unexpected piece {index} from {remote_id}")
+                        continue
+
                     # save_piece returns the new piece count, or None if we already had this piece
                     count = self.file_manager.save_piece(index, data)
+
+                    with self.lock:
+                        self.pending_requests.pop(remote_id, None)
+
                     if count is not None:
                         self.logger.download_piece(remote_id, index, count)
+                        # count bytes sent, used to rank neighbors by download rate
+                        self.record_download_rate(remote_id, len(data))
+                        #Announce that now this peer has the piece to all neighbors
+                        with self.lock:
+                            neighbors = list(self.connections)
 
-                # TODO: check if still interested in peer after receiving piece
-                # Message-specific processing will go here.
+                        for neighbor_id in neighbors:
+                            try:
+                                self.send_to_peer(neighbor_id, HAVE, pack_index(index))
+                            except (ConnectionError, OSError):
+                                pass
+
+                        #Check if the entire file is complete now
+                        if self.file_manager.is_complete():
+                            with self.lock:
+                                if not self.completion_logged:
+                                    self.completion_logged = True
+                                    self.logger.download_complete()
+                                    print("File download is complete")
+
+                    with self.lock:
+                        neighbors = list(self.connections)
+
+                    for neighbor_id in neighbors:
+                        self.update_interest(neighbor_id)
+                        self.request_piece(neighbor_id)
+
 
         except (ConnectionError, OSError, ValueError) as error:
             if self.running.is_set():
@@ -152,10 +218,78 @@ class Peer:
                     self.interested_in_peers.discard(remote_id)
                     self.preferred.discard(remote_id)
                     self.unchoked.discard(remote_id)
+                    self.unchoked_by.discard(remote_id)
+                    self.pending_requests.pop(remote_id, None)
+                    self.send_locks.pop(remote_id, None)
                     self.bytes_downloaded.pop(remote_id, None)
                     if self.optimistic == remote_id:
                         self.optimistic = None
             sock.close()
+
+    def update_interest(self, remote_id):
+        with self.lock:
+            bitfield = self.peer_bitfields.get(remote_id)
+            if bitfield is None:
+                return
+
+            missing = self.file_manager.missing_from(bitfield)
+            interested = remote_id in self.interested_in_peers
+
+            if missing and not interested:
+                message_type = INTERESTED
+                self.interested_in_peers.add(remote_id)
+            elif not missing and interested:
+                message_type = NOT_INTERESTED
+                self.interested_in_peers.discard(remote_id)
+            else:
+                return
+
+        self.send_to_peer(remote_id, message_type)
+
+
+    def request_piece(self, remote_id):
+        with self.lock:
+            #Request only from connected and unchoked peers
+            if remote_id not in self.connections:
+                return
+
+            if remote_id not in self.unchoked_by:
+                return
+
+            #Only one request per peer is allowed to be pending
+            if remote_id in self.pending_requests:
+                return
+
+            remote_bitfield = self.peer_bitfields.get(remote_id)
+            if remote_bitfield is None:
+                return
+
+            #Pieces the remote peer has that local peer does not
+            available = self.file_manager.missing_from(remote_bitfield)
+
+            #Take out any pieces that were already requested elsewhere
+            requested = set(self.pending_requests.values())
+            available = [idx for idx in available if idx not in requested]
+            if not available:
+                return
+
+            #Random piece selection
+            index = random.choice(available)
+
+            #Reserve piece before sending the REQUEST message for it
+            self.pending_requests[remote_id] = index
+
+        try:
+            self.send_to_peer(remote_id, REQUEST, pack_index(index))
+
+        except (ConnectionError, OSError):
+            with self.lock:
+                if self.pending_requests.get(remote_id) == index:
+                    self.pending_requests.pop(remote_id, None)
+            raise
+
+
+
 
     # adds nbytes to the peer's running total to determine downloading rate based on byte totals
     # called by PIECE handler
